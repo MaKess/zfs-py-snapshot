@@ -1,0 +1,391 @@
+#!/usr/bin/env python2.7
+
+import argparse
+import os
+import subprocess
+import re
+from collections import namedtuple
+from datetime import datetime, timedelta
+from time import strftime
+
+zfs = "/sbin/zfs"
+
+name_regex = re.compile(r"(.*)@(.*(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2}).*)")
+
+ZfsSet = namedtuple("ZfsSet", "name general frequent hourly daily weekly monthly yearly")
+ZfsSnapshot = namedtuple("ZfsSnapshot", "name creation")
+ZfsInterval = namedtuple("ZfsInterval", "start end snapshots")
+
+class Time(object):
+    def __init__(self, t=None):
+        self.t = datetime.now() if t is None else t
+
+    def copy(self):
+        return Time(self.t)
+
+    def previous_quarter_hour(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        if us or s or m % 15:
+            self.t = self.t.replace(minute=m - m % 15, second=0, microsecond=0)
+        else:
+            self.t -= timedelta(minutes=15)
+        return self.t
+
+    def previous_hour(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        if us or s or m:
+            self.t = self.t.replace(minute=0, second=0, microsecond=0)
+        else:
+            self.t -= timedelta(hours=1)
+        return self.t
+
+    def previous_day(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        h = self.t.hour
+        if us or s or m or h:
+            self.t = self.t.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            self.t -= timedelta(days=1)
+        return self.t
+
+    def previous_week(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        h = self.t.hour
+        wd = self.t.weekday()
+        if us or s or m or h or wd:
+            self.t = self.t.replace(hour=0, minute=0, second=0, microsecond=0)
+            self.t -= timedelta(days=wd)
+        else:
+            self.t -= timedelta(weeks=1)
+        return self.t
+
+    def previous_month(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        h = self.t.hour
+        d = self.t.day
+        M = self.t.month
+        y = self.t.year
+        if us or s or m or h or d != 1:
+            self.t = self.t.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            if M == 1:
+                M = 12
+                y -= 1
+            else:
+                M -= 1
+            self.t = datetime(year=y, month=M, day=1)
+        return self.t
+
+    def previous_year(self):
+        us = self.t.microsecond
+        s = self.t.second
+        m = self.t.minute
+        h = self.t.hour
+        d = self.t.day
+        M = self.t.month
+        y = self.t.year
+        if us or s or m or h or d != 1 or M != 1:
+            self.t = self.t.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            y -= 1
+            self.t = datetime(year=y, month=1, day=1)
+        return self.t
+
+    def __str__(self):
+        return str(self.t)
+
+def get_times(quarters,
+              hours,
+              days,
+              weeks,
+              months,
+              years,
+              now):
+    t = now
+    t_all = {datetime.min, datetime.max}
+
+    tt = t.copy()
+    t_all.update(tt.previous_quarter_hour() for _ in range(quarters))
+
+    tt = t.copy()
+    t_all.update(tt.previous_hour() for _ in range(hours))
+
+    tt = t.copy()
+    t_all.update(tt.previous_day() for _ in range(days))
+
+    tt = t.copy()
+    t_all.update(tt.previous_week() for _ in range(weeks))
+
+    tt = t.copy()
+    t_all.update(tt.previous_month() for _ in range(months))
+
+    tt = t.copy()
+    t_all.update(tt.previous_year() for _ in range(years))
+
+    return sorted(t_all)
+
+def parse_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    elif isinstance(value, str):
+        s = value.lower()
+        if s == "-":
+            return default
+        elif s in ("0", "false", "off"):
+            return False
+        elif s in ("1", "true", "on"):
+            return True
+        else:
+            raise ValueError
+    else:
+        raise TypeError
+
+def get_zfs_sets():
+    ret_l = []
+    for line in subprocess.check_output([zfs,
+                                         "list",
+                                         "-H",
+                                         "-t", "filesystem,volume",
+                                         "-o", "name,"
+                                               "com.sun:auto-snapshot,"
+                                               "com.sun:auto-snapshot:frequent,"
+                                               "com.sun:auto-snapshot:hourly,"
+                                               "com.sun:auto-snapshot:daily,"
+                                               "com.sun:auto-snapshot:weekly,"
+                                               "com.sun:auto-snapshot:monthly,"
+                                               "com.sun:auto-snapshot:yearly"]).split("\n"):
+        if not line:
+            continue
+
+        name, general, frequent, hourly, daily, weekly, monthly, yearly = line.split("\t")
+        ret_l.append(ZfsSet(name,
+                            parse_bool(general),
+                            parse_bool(frequent),
+                            parse_bool(hourly),
+                            parse_bool(daily),
+                            parse_bool(weekly),
+                            parse_bool(monthly),
+                            parse_bool(yearly)))
+    return ret_l
+
+def get_zfs_snapshots(zfs_set):
+    ret_l = []
+    for line in subprocess.check_output([zfs,
+                                         "list",
+                                         "-H",
+                                         "-p",
+                                         "-r",
+                                         "-d", "1",
+                                         "-t", "snapshot",
+                                         "-o", "name,creation",
+                                         "-s", "creation",
+                                         zfs_set]).split("\n"):
+        if not line:
+            continue
+
+        name, creation = line.split("\t")
+
+        if not name_regex.match(name):
+            continue
+
+        ret_l.append(ZfsSnapshot(name,
+                                 datetime.fromtimestamp(float(creation))))
+
+    return ret_l
+
+def get_recursive_regular_snapshots(sets_to_snapshot, sets_not_to_snapshot):
+    regular_snapshots = []
+    recursive_snapshot_candidates = {}
+
+    for snapshot in sorted(sets_to_snapshot):
+        for recursive_snapshot in recursive_snapshot_candidates:
+            if snapshot.startswith(recursive_snapshot + "/"):
+                recursive_snapshot_candidates[recursive_snapshot] += 1
+                break
+        else:
+            if any(no_snapshot.startswith(snapshot) for no_snapshot in sets_not_to_snapshot):
+                regular_snapshots.append(snapshot)
+            else:
+                recursive_snapshot_candidates[snapshot] = 0
+
+    recursive_snapshots = []
+    for snapshot, childrean in recursive_snapshot_candidates.iteritems():
+        (recursive_snapshots if childrean else regular_snapshots).append(snapshot)
+
+    return sorted(regular_snapshots), sorted(recursive_snapshots)
+
+def create_snapshot(zfs_set, prefix, recursive=False, dry_run=False, verbose=False):
+    cmd = [zfs, "snapshot"]
+    if recursive:
+        cmd.append("-r")
+    cmd.append("{0:s}@{1}_{2}".format(zfs_set, prefix, strftime("%Y-%m-%d-%H%M")))
+    if verbose:
+        print " ".join(cmd)
+    if not dry_run:
+        subprocess.check_call(cmd)
+
+def destroy_snapshot(snapshot, dry_run=False, verbose=False):
+    assert "@" in snapshot # safeguard to make sure we are only ever destroying snapshots, not entire file systems
+    cmd = [zfs, "destroy", snapshot]
+    if verbose:
+        print " ".join(cmd)
+    if not dry_run:
+        subprocess.check_call(cmd)
+
+def rename_snapshot(snapshot_old, snapshot_new, dry_run, verbose):
+    assert "@" in snapshot_old
+    assert "@" in snapshot_new
+    cmd = [zfs, "rename", snapshot_old, snapshot_new]
+    if verbose:
+        print " ".join(cmd)
+    if not dry_run:
+        subprocess.check_call(cmd)
+
+def main(args):
+    now = Time()
+
+    sets_to_snapshot = []
+    sets_not_to_snapshot = []
+    snapshots_to_delete = []
+    snapshots_to_rename = []
+
+    for zfs_set in get_zfs_sets():
+        times = get_times(args.keep_frequent if zfs_set.general and zfs_set.frequent else 0,
+                          args.keep_hourly if zfs_set.general and zfs_set.hourly else 0,
+                          args.keep_daily if zfs_set.general and zfs_set.daily else 0,
+                          args.keep_weekly if zfs_set.general and zfs_set.weekly else 0,
+                          args.keep_monthly if zfs_set.general and zfs_set.monthly else 0,
+                          args.keep_yearly if zfs_set.general and zfs_set.yearly else 0,
+                          now)
+        snapshots = get_zfs_snapshots(zfs_set.name)
+        intervals = []
+        for start, end in zip(times, times[1:]):
+            snapshots_in_interval = [snapshot for snapshot in snapshots if start <= snapshot.creation < end]
+            snapshots_to_delete += [snapshot.name for snapshot in snapshots_in_interval[1:]]
+
+            if snapshots_in_interval:
+                snapshots_in_interval_to_keep = snapshots_in_interval[0]
+                correct_name_snapshot = "{0:s}@{1}_{2}".format(zfs_set.name,
+                                                               args.snapshot_prefix,
+                                                               snapshots_in_interval_to_keep.creation.strftime("%Y-%m-%d-%H%M"))
+                if snapshots_in_interval_to_keep.name != correct_name_snapshot:
+                    snapshots_to_rename.append((snapshots_in_interval_to_keep.name, correct_name_snapshot))
+
+            intervals.append(ZfsInterval(start,
+                                         end,
+                                         snapshots_in_interval))
+
+        if intervals[-1].snapshots:
+            sets_not_to_snapshot.append(zfs_set.name)
+        else:
+            sets_to_snapshot.append(zfs_set.name)
+
+        if args.verbose:
+            print "ZFS set \"{}\"".format(zfs_set.name)
+            for start, end, snapshots_in_interval in intervals:
+                print "  between \"{}\" and \"{}\":".format(start, end)
+                if snapshots_in_interval:
+                    for snapshot in snapshots_in_interval:
+                        print "    - {}".format(snapshot.name)
+                else:
+                    print "    <none>"
+
+            print
+
+    regular_snapshots, recursive_snapshots = get_recursive_regular_snapshots(sets_to_snapshot, sets_not_to_snapshot)
+
+    if args.verbose:
+        print "sets not to snapshot:"
+        if sets_not_to_snapshot:
+            for zfs_set in sets_not_to_snapshot:
+                print "  - {}".format(zfs_set)
+        else:
+            print "  <none>"
+
+        print
+
+        print "sets to snapshot:"
+        if sets_to_snapshot:
+            for zfs_set in sets_to_snapshot:
+                print "  - {}".format(zfs_set)
+        else:
+            print "  <none>"
+
+        print
+
+        print "regular snapshots:"
+        if regular_snapshots:
+            for snapshot in regular_snapshots:
+                print "-", snapshot
+        else:
+            print "  <none>"
+
+        print
+
+        print "recursive snapshots:"
+        if recursive_snapshots:
+            for snapshot in recursive_snapshots:
+                print "-", snapshot
+        else:
+            print "  <none>"
+
+        print
+
+        print "snapshots to delete:"
+        if snapshots_to_delete:
+            for snapshot in snapshots_to_delete:
+                print "  - {}".format(snapshot)
+        else:
+            print "  <none>"
+
+        print
+        print "snapshots to rename:"
+        if snapshots_to_rename:
+            for old_name, new_name in snapshots_to_rename:
+                print "  - {} -> {}".format(old_name, new_name)
+        else:
+            print "  <none>"
+
+        print
+
+        print "commands to execute:"
+
+    for snapshot in regular_snapshots:
+        create_snapshot(snapshot, args.snapshot_prefix, False, args.dry_run, args.verbose)
+
+    for snapshot in recursive_snapshots:
+        create_snapshot(snapshot, args.snapshot_prefix, True, args.dry_run, args.verbose)
+
+    for snapshot in snapshots_to_delete:
+        destroy_snapshot(snapshot, args.dry_run, args.verbose)
+
+    for snapshot_old, snapshot_new in snapshots_to_rename:
+        rename_snapshot(snapshot_old, snapshot_new, args.dry_run, args.verbose)
+
+def get_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--keep-frequent", "-kf", type=int, default=4)
+    parser.add_argument("--keep-hourly", "-kh", type=int, default=24)
+    parser.add_argument("--keep-daily", "-kd", type=int, default=7)
+    parser.add_argument("--keep-weekly", "-kw", type=int, default=10)
+    parser.add_argument("--keep-monthly", "-kM", type=int, default=24)
+    parser.add_argument("--keep-yearly", "-ky", type=int, default=100)
+    parser.add_argument("--snapshot-prefix", "-p", type=str, default="snapshot")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--dry-run", "-n", action="store_true")
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main(get_args())
